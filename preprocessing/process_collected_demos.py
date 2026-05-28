@@ -11,19 +11,40 @@ logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 
-def process(dir, prompts):
-    # load model for embedding images
-    dinov2 = load_dinov2()
-    logger.info(f'loaded dinov2 for image embedding')
+def resolve_data_path(path):
+    if os.path.isabs(path):
+        return path
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(current_dir, path)
 
-    # get current directory and append the dir argument to get demo_dir
-    current_dir = os.path.dirname(os.path.abspath(__file__)) # get current directory
-    demo_dir = f"{current_dir}/{dir}"
+
+def child_dirs(parent_dir):
+    return [
+        os.path.join(parent_dir, name)
+        for name in sorted(os.listdir(parent_dir))
+        if not name.startswith(".") and os.path.isdir(os.path.join(parent_dir, name))
+    ]
+
+
+def process(data_dir, prompts):
+    # Resolve relative dataset paths from this script's directory.
+    demo_dir = resolve_data_path(data_dir)
     logger.info(f'absolute path of the {demo_dir=}')
 
     # get all the folders (demos) in the demo_dir
-    demo_folders = [f"{demo_dir}/{f}" for f in os.listdir(demo_dir) if os.path.isdir(f"{demo_dir}/{f}")]
+    demo_folders = [
+        demo_folder
+        for demo_folder in child_dirs(demo_dir)
+        if os.path.isfile(os.path.join(demo_folder, "trajectory.h5"))
+    ]
     logger.info(f'number of demo folders: {len(demo_folders)}')
+    if not demo_folders:
+        logger.warning(f'no demo folders with trajectory.h5 found in {demo_dir}')
+        return
+
+    # load model for embedding images
+    dinov2 = load_dinov2()
+    logger.info(f'loaded dinov2 for image embedding')
 
     # iterate over the demo_folders and read the trajectory.h5 files and the frames
     for demo_folder in demo_folders:
@@ -84,10 +105,12 @@ if __name__ == "__main__":
         assert args.prompts is not None, "If --dir is provided, --prompts must also be provided"
         process(args.dir, args.prompts)
     else:
-        for dir in os.listdir(args.dir_of_dirs):
-            temp_prompts = [" ".join(dir.split("_")[1:])]
-            logger.info(f'**About to start processing dir {args.dir_of_dirs}/{dir} with prompts {temp_prompts}**')
-            process(f"{args.dir_of_dirs}/{dir}", temp_prompts)
+        dir_of_dirs = resolve_data_path(args.dir_of_dirs)
+        for demo_group_dir in child_dirs(dir_of_dirs):
+            demo_group_name = os.path.basename(demo_group_dir)
+            temp_prompts = [" ".join(demo_group_name.split("_")[1:])]
+            logger.info(f'**About to start processing dir {demo_group_dir} with prompts {temp_prompts}**')
+            process(demo_group_dir, temp_prompts)
 
     print(f'done!')
 

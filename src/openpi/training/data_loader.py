@@ -17,6 +17,73 @@ import openpi.transforms as _transforms
 import json
 
 T_co = TypeVar("T_co", covariant=True)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+_COLLECTED_DEMOS_INFO_FILES = ["ep_idxs_to_fol", "fols_to_ep_idxs", "groups_to_ep_fols", "groups_to_ep_idxs"]
+
+
+def _resolve_repo_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return path
+    return os.path.join(_REPO_ROOT, path)
+
+
+def _default_collected_demos_training_dir() -> str:
+    return _resolve_repo_path(
+        "preprocessing/collected_demos_training"
+        if os.path.exists(_resolve_repo_path("preprocessing/collected_demos_training"))
+        else "ricl_droid_preprocessing/collected_demos_training"
+    )
+
+
+def _load_collected_demos_infos(outer_dir: str) -> dict:
+    outer_dir = _resolve_repo_path(outer_dir)
+    return {k: json.load(open(os.path.join(outer_dir, f"{k}.json"))) for k in _COLLECTED_DEMOS_INFO_FILES}
+
+
+def _find_collected_demos_root(outer_dir: str, collected_demos_infos: dict) -> str:
+    sample_path = next(iter(collected_demos_infos["ep_idxs_to_fol"].values()))
+    if os.path.isabs(sample_path):
+        return ""
+
+    candidates = [
+        os.path.dirname(outer_dir),
+        os.path.dirname(os.path.dirname(outer_dir)),
+        _resolve_repo_path("preprocessing"),
+        _resolve_repo_path("ricl_droid_preprocessing"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(os.path.join(candidate, sample_path)):
+            return candidate
+    return candidates[0]
+
+
+def _collected_demo_file(collected_demos_root: str, ep_fol: str, filename: str) -> str:
+    if os.path.isabs(ep_fol):
+        return os.path.join(ep_fol, filename)
+    return os.path.join(collected_demos_root, ep_fol, filename)
+
+
+def _collect_existing_indices_files(collected_demos_infos: dict, collected_demos_root: str) -> list[tuple[int, str]]:
+    indices_files = []
+    missing_files = []
+    for ep_fols in collected_demos_infos["groups_to_ep_fols"].values():
+        for ep_fol in ep_fols:
+            file_path = _collected_demo_file(collected_demos_root, ep_fol, "indices_and_distances.npz")
+            if os.path.exists(file_path):
+                indices_files.append((int(collected_demos_infos["fols_to_ep_idxs"][ep_fol]), file_path))
+            else:
+                missing_files.append(file_path)
+
+    if missing_files:
+        print(
+            f"Skipping {len(missing_files)} missing collected demo indices files. "
+            f"First missing file: {missing_files[0]}"
+        )
+    if not indices_files:
+        raise FileNotFoundError("No collected demo indices_and_distances.npz files were found.")
+    return indices_files
 
 
 class Dataset(Protocol[T_co]):
@@ -100,23 +167,22 @@ def get_action_chunk(action_joint_vels, action_gripper_pos, step_idx, action_hor
 class Pi0FastDroidFinetuneDataset(Dataset):
     def __init__(self, model_config: _pi0_fast_ricl.Pi0FASTRiclConfig, finetuning_collected_demos_dir: str | None):
         assert finetuning_collected_demos_dir is not None
-        collected_demos_infos = {k: json.load(open(f"{finetuning_collected_demos_dir}/{k}.json")) for k in ['ep_idxs_to_fol', 'fols_to_ep_idxs', 'groups_to_ep_fols', 'groups_to_ep_idxs']}
+        outer_dir = _resolve_repo_path(finetuning_collected_demos_dir)
+        collected_demos_infos = _load_collected_demos_infos(outer_dir)
+        collected_demos_root = _find_collected_demos_root(outer_dir, collected_demos_infos)
         
         # files from the collected demos for training
-        indices_files = [] 
-        for group_name, ep_fols in collected_demos_infos["groups_to_ep_fols"].items():
-            for ep_fol in ep_fols:
-                indices_files.append(f"ricl_droid_preprocessing/{ep_fol}/indices_and_distances.npz")
+        indices_files = _collect_existing_indices_files(collected_demos_infos, collected_demos_root)
         
         # actual loading...
         count_collected_demos = 0
         all_query_indices = []
-        for file_idx, file_path in enumerate(indices_files):
+        for ep_idx, file_path in indices_files:
             indices_and_dists = np.load(file_path)
             query_indices = indices_and_dists["query_indices"]
             num_steps = query_indices.shape[0]
             assert query_indices.shape == (num_steps, 2) and query_indices.dtype == np.int32
-            expected_query_indices = np.array([[100000+file_idx, i] for i in range(num_steps)], dtype=np.int32)
+            expected_query_indices = np.array([[ep_idx, i] for i in range(num_steps)], dtype=np.int32)
             assert np.allclose(query_indices, expected_query_indices), f"{query_indices=}, {expected_query_indices=}"
             all_query_indices.append(query_indices)
             count_collected_demos += num_steps
@@ -130,9 +196,9 @@ class Pi0FastDroidFinetuneDataset(Dataset):
         # load all data paths 
         all_ep_idxs = list(np.unique(all_query_indices[:, 0]))
         all_ep_data_paths = {ep_idx: 
-                                    f"ricl_droid_preprocessing/{collected_demos_infos['ep_idxs_to_fol'][str(ep_idx)]}/processed_demo.npz"
+                                    _collected_demo_file(collected_demos_root, collected_demos_infos['ep_idxs_to_fol'][str(ep_idx)], "processed_demo.npz")
                             for ep_idx in all_ep_idxs}
-        common_prompt = " ".join(collected_demos_infos['ep_idxs_to_fol']['100000'].split("/")[1].split("_")[1:])
+        common_prompt = " ".join(collected_demos_infos['ep_idxs_to_fol'][str(all_ep_idxs[0])].split("/")[1].split("_")[1:])
         print(f'num episodes: {len(all_ep_idxs)}')
         print(f"common_prompt: {common_prompt}")
 
@@ -166,8 +232,9 @@ class RiclDroidDataset(Dataset):
         assert num_retrieved_observations <= knn_k
         embedding_type = "embeddings__wrist_image_left" # retrieval based on embeddings of wrist images
         indices_and_dists_fol = f"ricl_droid_preprocessing/droid_new_broken_up_indices_and_distances/chosenIDscene_id_numepisodes20_embtype{embedding_type}_knnk100"
-        outer_dir = "ricl_droid_preprocessing/collected_demos_training" if finetuning_collected_demos_dir is None else finetuning_collected_demos_dir
-        collected_demos_infos = {k: json.load(open(f"{outer_dir}/{k}.json")) for k in ['ep_idxs_to_fol', 'fols_to_ep_idxs', 'groups_to_ep_fols', 'groups_to_ep_idxs']}
+        outer_dir = _default_collected_demos_training_dir() if finetuning_collected_demos_dir is None else _resolve_repo_path(finetuning_collected_demos_dir)
+        collected_demos_infos = _load_collected_demos_infos(outer_dir)
+        collected_demos_root = _find_collected_demos_root(outer_dir, collected_demos_infos)
         # load indices_and_dists
         all_retrieved_indices = []
         all_query_indices = []
@@ -179,9 +246,9 @@ class RiclDroidDataset(Dataset):
         indices_files = [] ## no files from droid dataset
 
         # files from the collected demos for training
-        for group_name, ep_fols in collected_demos_infos["groups_to_ep_fols"].items():
-            for ep_fol in ep_fols:
-                indices_files.append(f"ricl_droid_preprocessing/{ep_fol}/indices_and_distances.npz")
+        indices_files.extend(
+            file_path for _, file_path in _collect_existing_indices_files(collected_demos_infos, collected_demos_root)
+        )
         # actual loading...
         count_droid = 0
         count_collected_demos = 0
@@ -213,7 +280,16 @@ class RiclDroidDataset(Dataset):
         # normalize all_distances and convert to float32
         max_dist_value = json.load(open(f"assets/max_distance.json", 'r'))['distances']['max']
         if finetuning_collected_demos_dir is None:
-            assert max_dist_value == np.max(all_distances), f"{max_dist_value=} from norm stats time does not match {np.max(all_distances)=} from dataset"
+            dataset_max_dist_value = np.max(all_distances)
+            if dataset_max_dist_value > max_dist_value:
+                raise ValueError(
+                    f"{max_dist_value=} from norm stats time is smaller than {dataset_max_dist_value=} from dataset"
+                )
+            if not np.isclose(max_dist_value, dataset_max_dist_value):
+                print(
+                    f"Using max distance value {max_dist_value} from assets/max_distance.json; "
+                    f"available dataset max is {dataset_max_dist_value}."
+                )
             print(f'max distance value: {max_dist_value}')
         all_distances = all_distances / max_dist_value
         all_distances = all_distances.astype(np.float32)
@@ -225,7 +301,7 @@ class RiclDroidDataset(Dataset):
         all_ep_data_paths = {ep_idx: 
                                     f"{ds_fol}/episode_{ep_idx}.npz" 
                                     if ep_idx < 100000 else 
-                                    f"ricl_droid_preprocessing/{collected_demos_infos['ep_idxs_to_fol'][str(ep_idx)]}/processed_demo.npz"
+                                    _collected_demo_file(collected_demos_root, collected_demos_infos['ep_idxs_to_fol'][str(ep_idx)], "processed_demo.npz")
                             for ep_idx in all_ep_idxs}
         all_ep_prompts = {ep_idx: 
                                     json.load(open(f"{ds_fol}/episode_{ep_idx}.json"))["language_instruction"]  
