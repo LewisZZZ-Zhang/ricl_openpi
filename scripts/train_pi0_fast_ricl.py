@@ -151,7 +151,10 @@ def init_train_state(
 
 def create_decode_indices(config: _config.TrainConfig) -> at.Int[at.Array, "decode_len"]:
     # create the indices to decide which tokens to decode: i.e. only those belonging to each retrieved/query "prompt, state, action" prompt and not the images
-    image_token_len = 256*2 # number of image tokens times number of images
+    # Pi0FAST/RICL currently has three image slots. Derive this from the model spec
+    # rather than silently assuming two views, which misaligns loss tokens for LIBERO.
+    observation_spec, _ = config.model.inputs_spec()
+    image_token_len = 256 * len(observation_spec.images)
     prompt_token_len = config.model.max_token_len # max token len for each retrieved/query "prompt, state, action" prompt
     total_token_len = image_token_len + prompt_token_len
     decode_indices = []

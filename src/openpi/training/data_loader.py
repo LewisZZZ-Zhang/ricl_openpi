@@ -14,6 +14,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_fast_ricl as _pi0_fast_ricl
 import openpi.training.config as _config
 import openpi.transforms as _transforms
+from openpi.training.libero_ricl_dataset import RiclLiberoDataset
 import json
 
 T_co = TypeVar("T_co", covariant=True)
@@ -370,7 +371,16 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    if "ricl" in config.name:
+    is_ricl = isinstance(config.model, _pi0_fast_ricl.Pi0FASTRiclConfig)
+    if is_ricl and config.ricl_corpus_dir is not None:
+        dataset = RiclLiberoDataset(
+            config.ricl_corpus_dir,
+            num_retrieved_observations=config.model.num_retrieved_observations,
+            action_horizon=config.model.action_horizon,
+            use_action_interpolation=config.model.use_action_interpolation,
+            lamda=config.model.lamda,
+        )
+    elif is_ricl:
         dataset = RiclDroidDataset(config.model, config.finetuning_collected_demos_dir)
     elif "pi0_fast_droid___finetune_on_" in config.name:
         dataset = Pi0FastDroidFinetuneDataset(config.model, config.finetuning_collected_demos_dir)
@@ -398,7 +408,7 @@ def create_data_loader(
 
         def __iter__(self):
             for batch in self._data_loader:
-                if "ricl" in config.name:
+                if is_ricl:
                     yield _model.RiclObservation.from_dict(batch, config.model.num_retrieved_observations), batch["query_actions"]
                 else:
                     yield _model.Observation.from_dict(batch), batch["actions"]

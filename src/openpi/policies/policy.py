@@ -14,6 +14,7 @@ from typing_extensions import override
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models import pi0_fast_ricl as _pi0_fast_ricl
+from openpi.policies.libero_retrieval import LiberoRiclCorpus, libero_action_chunk
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 from openpi.policies.utils import embed, embed_with_batches, load_dinov2, EMBED_DIM
@@ -237,6 +238,97 @@ class RiclPolicy(BasePolicy):
         final_outputs = self._output_transform(outputs)
         print(f'final_outputs: {final_outputs}')
         return final_outputs
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._metadata
+
+
+class RiclLiberoPolicy(BasePolicy):
+    """RICL policy whose retrieval bank is scoped to the current LIBERO task."""
+
+    def __init__(
+        self,
+        model: _pi0_fast_ricl.Pi0FASTRicl,
+        *,
+        rng: at.KeyArrayLike | None = None,
+        transforms: Sequence[_transforms.DataTransformFn] = (),
+        output_transforms: Sequence[_transforms.DataTransformFn] = (),
+        sample_kwargs: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        corpus_dir: str,
+        use_action_interpolation: bool,
+        lamda: float,
+        action_horizon: int,
+    ):
+        self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        self._input_transform = _transforms.compose(transforms)
+        self._output_transform = _transforms.compose(output_transforms)
+        self._rng = rng or jax.random.key(0)
+        self._sample_kwargs = sample_kwargs or {}
+        self._metadata = metadata or {}
+        self._model = model
+        self._corpus = LiberoRiclCorpus(corpus_dir)
+        self._knn_k = model.num_retrieved_observations
+        if self._knn_k != int(self._corpus.metadata["num_retrieved"]):
+            raise ValueError(
+                f"Model expects {self._knn_k} retrieved observations, corpus contains "
+                f"{self._corpus.metadata['num_retrieved']}"
+            )
+        self._use_action_interpolation = use_action_interpolation
+        self._lamda = lamda
+        self._action_horizon = action_horizon
+        logger.info("Loading DINOv2 retrieval encoder for LIBERO corpus: %s", corpus_dir)
+        self._dinov2 = load_dinov2()
+
+    def retrieve(self, obs: dict) -> dict:
+        if "retrieval_task_id" not in obs:
+            raise KeyError("RICL-LIBERO inference requires a stable retrieval_task_id")
+        task_id = int(np.asarray(obs["retrieval_task_id"]).item())
+        query_embedding = embed(
+            obs["query_top_image"], self._dinov2, embedding_type=self._corpus.embedding_type
+        )
+        if query_embedding.shape[0] != 1:
+            raise ValueError(f"Expected one query image, got embedding shape {query_embedding.shape}")
+        _, bank_indices = self._corpus.search(task_id, query_embedding[0], self._knn_k)
+        task = self._corpus.task(task_id)
+        retrieved: dict[str, Any] = {"inference_time": True}
+        for retrieved_number, bank_index in enumerate(bank_indices):
+            demo_id, step_idx = self._corpus.retrieved_ref(task_id, int(bank_index))
+            frame = self._corpus.read_frame(task_id, demo_id, step_idx)
+            prefix = f"retrieved_{retrieved_number}_"
+            retrieved[f"{prefix}top_image"] = frame["top_image"]
+            retrieved[f"{prefix}wrist_image"] = frame["wrist_image"]
+            retrieved[f"{prefix}state"] = frame["state"]
+            retrieved[f"{prefix}actions"] = libero_action_chunk(frame["actions"], step_idx, self._action_horizon)
+            retrieved[f"{prefix}prompt"] = task["prompt"]
+
+        if self._use_action_interpolation:
+            bank = self._corpus.context_bank(task_id)
+            retrieved_embeddings = bank.embeddings[bank_indices]
+            first_embedding = retrieved_embeddings[0]
+            relative_distances = [0.0]
+            relative_distances.extend(np.linalg.norm(embedding - first_embedding) for embedding in retrieved_embeddings[1:])
+            relative_distances.append(np.linalg.norm(query_embedding[0] - first_embedding))
+            normalized = np.clip(np.asarray(relative_distances), 0, self._corpus.max_distance) / self._corpus.max_distance
+            retrieved["exp_lamda_distances"] = np.exp(-self._lamda * normalized).reshape(-1, 1)
+        return {**obs, **retrieved}
+
+    @override
+    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
+        inputs = self.retrieve(dict(obs))
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        self._rng, sample_rng = jax.random.split(self._rng)
+        outputs = {
+            "query_actions": self._sample_actions(
+                sample_rng,
+                _model.RiclObservation.from_dict(inputs, num_retrieved_observations=self._knn_k),
+                **self._sample_kwargs,
+            )
+        }
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        return self._output_transform(outputs)
 
     @property
     def metadata(self) -> dict[str, Any]:

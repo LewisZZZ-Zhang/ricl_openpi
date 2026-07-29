@@ -400,10 +400,60 @@ class RiclDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RiclLiberoDataConfig(DataConfigFactory):
+    """Transforms for RICL trained on raw LIBERO-100 demonstration corpora."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: pi0_fast_ricl.Pi0FASTRiclConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                libero_policy.RiclLiberoInputs(
+                    action_dim=model_config.action_dim,
+                    num_retrieved_observations=model_config.num_retrieved_observations,
+                )
+            ],
+            outputs=[libero_policy.RiclLiberoOutputs()],
+        )
+        model_transforms = _transforms.Group(
+            inputs=[
+                _transforms.ResizeImagesRicl(224, 224, model_config.num_retrieved_observations),
+                _transforms.TokenizeFASTInputsRicl(
+                    _tokenizer.FASTTokenizerRicl(
+                        max_len=model_config.max_token_len,
+                        action_horizon=model_config.action_horizon,
+                        action_dim=model_config.action_dim,
+                    ),
+                    num_retrieved_observations=model_config.num_retrieved_observations,
+                ),
+            ],
+            outputs=[
+                _transforms.ExtractFASTActionsRicl(
+                    _tokenizer.FASTTokenizerRicl(
+                        max_len=model_config.max_token_len,
+                        action_horizon=model_config.action_horizon,
+                        action_dim=model_config.action_dim,
+                    ),
+                    action_horizon=model_config.action_horizon,
+                    action_dim=model_config.action_dim,
+                )
+            ],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=_transforms.Group(inputs=[_transforms.IdentityTransform()]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
     finetuning_collected_demos_dir: str | None = None
+    # Path to a preprocessed LIBERO RICL corpus. Only used by RICL-LIBERO configs.
+    ricl_corpus_dir: str | None = None
     # Project name.
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
@@ -587,6 +637,41 @@ _CONFIGS = [
         save_interval=100,
         keep_period=100,
         lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=50, peak_lr=2.5e-5, decay_steps=1_000, decay_lr=2.5e-6),
+    ),
+    #
+    # RICL on LIBERO-100. Build the corpus with
+    # preprocessing/build_libero_ricl_corpus.py before computing norm stats or training.
+    #
+    TrainConfig(
+        name="pi0_fast_libero_ricl",
+        ricl_corpus_dir="data/processed/ricl_libero100_70_30",
+        model=pi0_fast_ricl.Pi0FASTRiclConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            num_retrieved_observations=4,
+            use_action_interpolation=False,
+            lamda=10.0,
+        ),
+        data=RiclLiberoDataConfig(
+            repo_id="ricl_libero",
+            assets=AssetsConfig(assets_dir="./assets", asset_id="libero_ricl"),
+            base_config=DataConfig(prompt_from_task=False, local_files_only=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=16,
+        freeze_filter=pi0_fast_ricl.Pi0FASTRiclConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            num_retrieved_observations=4,
+        ).get_freeze_filter_with_frozen_img_encoder(),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=1_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6),
     ),
     #
     # Fine-tuning Libero configs.

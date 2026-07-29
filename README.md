@@ -138,5 +138,76 @@ uv run scripts/serve_policy_ricl.py policy:checkpoint --policy.config=pi0_fast_d
 
 Run the client on the laptop connected to the franka droid robot to test the finetuned policy.
 
+## RICL on LIBERO-100
+
+LIBERO-100 support uses task-scoped retrieval: DINOv2 embeds the current
+`agentview` image, performs exact L2 Top-K search only over the current task's
+context demonstrations, and inserts the retrieved action chunks as RICL context.
+The query episode is never in its own training retrieval bank, and evaluation
+never adds rollout data to the bank.
+
+From this repository's root, first build a corpus. The existing 70/30 manifest
+uses ten context demos and forty query demos per task:
+
+```bash
+cd third_party/ricl_openpi
+uv run preprocessing/build_libero_ricl_corpus.py \
+  --dataset-root ../LIBERO/libero/datasets \
+  --libero-root ../LIBERO \
+  --split-manifest ../../configs/libero100_task70_ctx10_unseen30.json \
+  --output-dir ../../data/processed/ricl_libero100_70_30
+
+uv run scripts/compute_libero_ricl_norm_stats.py \
+  --corpus-dir ../../data/processed/ricl_libero100_70_30 \
+  --output-dir assets/libero_ricl
+```
+
+The corpus defaults to a compact DINO CLS embedding. Pass
+`--embedding-type 64PATCHES` to reproduce the original RICL patch embedding at
+substantially higher storage cost. Build this corpus on a GPU node: it runs
+DINOv2 over all context and query frames.
+
+Train with the LIBERO RICL config (the `ricl_corpus_dir` value can be overridden
+on the command line):
+
+```bash
+uv run scripts/train_pi0_fast_ricl.py pi0_fast_libero_ricl \
+  --exp-name libero100_ricl \
+  --ricl-corpus-dir ../../data/processed/ricl_libero100_70_30 \
+  --overwrite
+```
+
+Serve a checkpoint and evaluate it in LIBERO. By default, the evaluator selects
+the 30 corpus tasks marked `is_train=false` and runs all 50 LIBERO initial states
+for each selected task. `libero_100` visits both the LIBERO-90 and LIBERO-10
+suites because upstream LIBERO exposes those as separate runnable task maps.
+Pass `--task-split train` or `--task-split all` for the other task subsets.
+
+```bash
+# Terminal 1
+uv run scripts/serve_policy_libero_ricl.py \
+  --checkpoint-dir checkpoints/pi0_fast_libero_ricl/libero100_ricl/30000 \
+  --corpus-dir ../../data/processed/ricl_libero100_70_30
+
+# Terminal 2 (with the LIBERO client environment activated)
+python examples/libero/main_ricl.py \
+  --corpus-dir ../../data/processed/ricl_libero100_70_30 \
+  --task-suite-name libero_100 \
+  --task-split unseen \
+  --num-trials-per-task 50 \
+  --metrics-path data/libero/metrics_ricl_unseen50.json
+```
+
+The workspace-level `shells/run_ricl_libero100_eval_h200.sh` launcher starts one
+policy server and four LIBERO clients by default in one H200 allocation. The
+clients share the server and evaluate disjoint round-robin task shards (the 30
+unseen tasks are split 8/8/7/7). Set `NUM_CLIENTS=2`, `3`, or `4` to control the
+parallelism. Each client writes task-level progress to
+`<output>/shards/shard_XX_of_YY/metrics.json`; after every client completes, the
+launcher validates that no task is missing or duplicated and atomically writes
+the merged `<output>/metrics.json`. The merged file contains per-episode
+outcomes, per-task success rates, suite summaries, per-shard summaries, and the
+overall success rate.
+
 ## Credits
 This repository is based on the [openpi](https://github.com/openai/openpi) repository, without which this work would not have been possible.

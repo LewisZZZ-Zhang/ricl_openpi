@@ -115,3 +115,56 @@ class LiberoOutputs(transforms.DataTransformFn):
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
         return {"actions": np.asarray(data["actions"][:, :7])}
+
+
+@dataclasses.dataclass(frozen=True)
+class RiclLiberoInputs(transforms.DataTransformFn):
+    """Map retrieved/query LIBERO frames to the multi-block RICL input schema."""
+
+    action_dim: int
+    num_retrieved_observations: int
+
+    def __call__(self, data: dict) -> dict:
+        all_prefixes = [f"retrieved_{i}_" for i in range(self.num_retrieved_observations)] + ["query_"]
+        inputs: dict = {}
+        for prefix in all_prefixes:
+            top_image = _parse_image(data[f"{prefix}top_image"])
+            wrist_image = _parse_image(data[f"{prefix}wrist_image"])
+            # π0-FAST expects three camera slots. LIBERO has an agent view and one wrist view.
+            inputs[f"{prefix}state"] = np.asarray(data[f"{prefix}state"], dtype=np.float32)
+            inputs[f"{prefix}image"] = {
+                "base_0_rgb": top_image,
+                "base_1_rgb": np.zeros_like(top_image),
+                "wrist_0_rgb": wrist_image,
+            }
+            # FAST models do not mask camera padding; this mirrors LiberoInputs above.
+            inputs[f"{prefix}image_mask"] = {
+                "base_0_rgb": np.True_,
+                "base_1_rgb": np.True_,
+                "wrist_0_rgb": np.True_,
+            }
+            inputs[f"{prefix}prompt"] = data[f"{prefix}prompt"]
+
+        for prefix in all_prefixes[:-1]:
+            actions = np.asarray(data[f"{prefix}actions"], dtype=np.float32)
+            if actions.shape[-1] != self.action_dim:
+                raise ValueError(f"Expected {self.action_dim}-D retrieved actions, got {actions.shape}")
+            inputs[f"{prefix}actions"] = actions
+        if "query_actions" in data:
+            actions = np.asarray(data["query_actions"], dtype=np.float32)
+            if actions.shape[-1] != self.action_dim:
+                raise ValueError(f"Expected {self.action_dim}-D query actions, got {actions.shape}")
+            inputs["query_actions"] = actions
+        if "exp_lamda_distances" in data:
+            inputs["exp_lamda_distances"] = data["exp_lamda_distances"]
+        if "inference_time" in data:
+            inputs["inference_time"] = data["inference_time"]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class RiclLiberoOutputs(transforms.DataTransformFn):
+    """Return the 7-D LIBERO action chunk from RICL's query output."""
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["query_actions"][:, :7])}

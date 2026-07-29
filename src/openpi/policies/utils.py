@@ -14,7 +14,19 @@ import math
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 EMBEDDING_TYPE = '64PATCHES' # 'CLS', 'AVG', '16PATCHES'
-EMBED_DIM = int(EMBEDDING_TYPE.split('PATCHES')[0])*768 # based on the choice of the embedding type arg above
+_DINO_FEATURE_DIM = 768
+
+
+def embedding_dim(embedding_type: str = EMBEDDING_TYPE) -> int:
+	"""Return the DINOv2 embedding width produced by ``embed``."""
+	if embedding_type in {'CLS', 'AVG'}:
+		return _DINO_FEATURE_DIM
+	if embedding_type.endswith('PATCHES'):
+		return int(embedding_type.removesuffix('PATCHES')) * _DINO_FEATURE_DIM
+	raise ValueError(f'Unsupported DINO embedding type: {embedding_type}')
+
+
+EMBED_DIM = embedding_dim()
 
 def init_logging():
 	"""Custom logging format for better readability."""
@@ -73,20 +85,20 @@ def process_dinov2(images):
 		images = images.cuda()
 	return images
 
-def embed(images, dinov2):
+def embed(images, dinov2, embedding_type: str = EMBEDDING_TYPE):
 	images = process_dinov2(images)
 
 	with torch.no_grad():
 		features = dinov2.forward_features(images) # dict_keys(['x_norm_clstoken', 'x_norm_regtokens', 'x_norm_patchtokens', 'x_prenorm', 'masks']) # shape of x_norm_regtokens = (batch_size, 0, 768)
-		if EMBEDDING_TYPE == 'CLS': # output of the CLS token
+		if embedding_type == 'CLS': # output of the CLS token
 			batch_embeddings = features["x_norm_clstoken"] # (batch_size, 768)
-		elif EMBEDDING_TYPE == 'AVG': # average of num_tokens (e.g., num_tokens = 256 for 224x224 image since patch size is 14)
+		elif embedding_type == 'AVG': # average of num_tokens (e.g., num_tokens = 256 for 224x224 image since patch size is 14)
 			batch_embeddings = features["x_norm_patchtokens"] # (batch_size, num_tokens, 768)
 			batch_embeddings = batch_embeddings.mean(dim=1) # (batch_size, 768)
-		elif 'PATCHES' in EMBEDDING_TYPE: # reduces 256 patches to N patches
+		elif embedding_type.endswith('PATCHES'): # reduces 256 patches to N patches
 			batch_embeddings = features["x_norm_patchtokens"] # (batch_size, 256, 768)
 			batch_size = batch_embeddings.shape[0]
-			N_patches = int(EMBEDDING_TYPE.split('PATCHES')[0])
+			N_patches = int(embedding_type.removesuffix('PATCHES'))
 			assert 256 % N_patches == 0, f"256 is not divisible by {N_patches=}"
 			assert math.sqrt(N_patches) ** 2 == N_patches, f"{N_patches=} must be a perfect square"
 			patches = []
@@ -104,13 +116,15 @@ def embed(images, dinov2):
 					patches.append(patch)
 			assert len(patches) == N_patches, f"{len(patches)=} {N_patches=}"
 			batch_embeddings = torch.cat(patches, dim=1) # (batch_size, 16*768)
+		else:
+			raise ValueError(f'Unsupported DINO embedding type: {embedding_type}')
 
 	return batch_embeddings.cpu().numpy()
 
-def embed_with_batches(images, dinov2, batch_size=256):
+def embed_with_batches(images, dinov2, batch_size=256, embedding_type: str = EMBEDDING_TYPE):
 	all_embeddings = []
 	for i in range(0, len(images), batch_size):
 		images_batch = images[i:i+batch_size]
-		embeddings = embed(images_batch, dinov2)
+		embeddings = embed(images_batch, dinov2, embedding_type=embedding_type)
 		all_embeddings.append(embeddings)
 	return np.concatenate(all_embeddings, axis=0)
