@@ -198,9 +198,38 @@ python examples/libero/main_ricl.py \
   --metrics-path data/libero/metrics_ricl_unseen50.json
 ```
 
-The workspace-level `shells/run_ricl_libero100_eval_h200.sh` launcher starts one
-policy server and four LIBERO clients by default in one H200 allocation. The
-clients share the server and evaluate disjoint round-robin task shards (the 30
+The workspace-level `shells/run_ricl_libero100_h200.sh` script is the unified
+Slurm entry point. Every invocation submits exactly one H200 job. Its `MODE`
+selects which phases that job runs:
+
+```bash
+# Train, then evaluate in the same allocation. This is the default mode.
+MODE=train_eval EXP_NAME=libero100_ricl_seed7 OVERWRITE=1 \
+  bash shells/run_ricl_libero100_h200.sh
+
+# Train only.
+MODE=train EXP_NAME=libero100_ricl_seed7 RESUME=1 \
+  bash shells/run_ricl_libero100_h200.sh
+
+# Evaluate only.
+MODE=eval EXP_NAME=libero100_ricl_seed7 EVAL_CHECKPOINT_STEP=10000 \
+  bash shells/run_ricl_libero100_h200.sh
+```
+
+`train+eval` is accepted as an alias for `train_eval`. In `train_eval` mode,
+evaluation begins only after training exits successfully. Without
+`EVAL_CHECKPOINT_STEP`, the evaluation phase selects the highest numeric
+checkpoint containing `_CHECKPOINT_METADATA`; setting it evaluates that exact
+step instead. `TIME_LIMIT` applies to the combined runtime of both phases, and
+defaults to 24 hours. Evaluation starts only if training finishes before that limit. The cluster's
+`gpu48` QOS currently caps a single job at 48 hours, so a long run may need to
+resume a partially trained experiment for `train_eval` to leave enough time for
+evaluation.
+
+The workspace-level `shells/run_ricl_libero100_eval_h200.sh` remains available
+as the standalone evaluation implementation used by the unified workflow. It
+starts one policy server and four LIBERO clients by default in one H200
+allocation. The clients share the server and evaluate disjoint round-robin task shards (the 30
 unseen tasks are split 8/8/7/7). Set `NUM_CLIENTS=2`, `3`, or `4` to control the
 parallelism. Each client writes task-level progress to
 `<output>/shards/shard_XX_of_YY/metrics.json`; after every client completes, the
