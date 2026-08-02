@@ -48,12 +48,18 @@ def initialize_checkpoint_dir(
         ),
     )
 
-    # special case: the checkpoint directory exists and the user requests to resume training, but the training run did
-    # not get to the first checkpoint saved. in this case, we don't actually want the train script to try and restore a
-    # checkpoint, since it will fail.
-    if resuming and tuple(mngr.all_steps()) in [(), (0,)]:
+    # If the run did not reach its first save, initialize normally instead of trying to restore.
+    checkpoint_steps = tuple(mngr.all_steps())
+    if resuming and not checkpoint_steps:
         logging.info("Checkpoint directory exists, but does not contain any checkpoints. Aborting resume.")
         resuming = False
+    elif resuming:
+        latest_step = mngr.latest_step()
+        if latest_step is None or not (checkpoint_dir / str(latest_step) / "train_state").exists():
+            raise ValueError(
+                f"Checkpoint step {latest_step} does not contain train_state and cannot be resumed. "
+                "Use its params as a weight-loader checkpoint, or start a new run."
+            )
 
     return mngr, resuming
 
@@ -71,12 +77,12 @@ def save_state(
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
 
-    # Split params that can be used for inference into a separate item.
+    # Keep inference params separate while retaining step and optimizer state for exact resume.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
     items = {
         "assets": save_assets,
-        # "train_state": train_state, # Commented out to reduce saving time and memory
+        "train_state": train_state,
         "params": {"params": params},
     }
     checkpoint_manager.save(step, items)

@@ -69,3 +69,17 @@ def test_merge_round_robin_shards(tmp_path) -> None:
         "success_rate": 0.5,
     }
     assert [task["task_global_index"] for task in merged["suites"]["libero_90"]["tasks"]] == [0, 1, 2, 3]
+
+    per_task = merge_ricl_metrics.per_task_metrics(merged)
+    assert per_task["overall"] == merged["overall"]
+    assert [task["task_global_index"] for task in per_task["tasks"]] == [0, 1, 2, 3]
+    assert per_task["tasks"][0] == {
+        "suite": "libero_90",
+        "task_global_index": 0,
+        "task_index": 0,
+        "task_id": 0,
+        "task_name": "task_0",
+        "episodes": 2,
+        "successes": 1,
+        "success_rate": 0.5,
+    }

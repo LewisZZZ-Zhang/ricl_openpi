@@ -20,6 +20,7 @@ import openpi.models.pi0_fast_ricl as pi0_fast_ricl
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.lerobot_ricl_policy as lerobot_ricl_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -448,12 +449,64 @@ class RiclLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RiclLeRobotDataConfig(DataConfigFactory):
+    """Transforms for 14-D state, 16-D action LeRobot RICL corpora."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: pi0_fast_ricl.Pi0FASTRiclConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                lerobot_ricl_policy.RiclLeRobotInputs(
+                    action_dim=model_config.action_dim,
+                    num_retrieved_observations=model_config.num_retrieved_observations,
+                )
+            ],
+            outputs=[lerobot_ricl_policy.RiclLeRobotOutputs(action_dim=model_config.action_dim)],
+        )
+        tokenizer = _tokenizer.FASTTokenizerRicl(
+            max_len=model_config.max_token_len,
+            action_horizon=model_config.action_horizon,
+            action_dim=model_config.action_dim,
+        )
+        model_transforms = _transforms.Group(
+            inputs=[
+                lerobot_ricl_policy.PadRiclLeRobotStates(
+                    action_dim=model_config.action_dim,
+                    num_retrieved_observations=model_config.num_retrieved_observations,
+                ),
+                _transforms.ResizeImagesRicl(224, 224, model_config.num_retrieved_observations),
+                _transforms.TokenizeFASTInputsRicl(
+                    tokenizer,
+                    num_retrieved_observations=model_config.num_retrieved_observations,
+                ),
+            ],
+            outputs=[
+                _transforms.ExtractFASTActionsRicl(
+                    tokenizer,
+                    action_horizon=model_config.action_horizon,
+                    action_dim=model_config.action_dim,
+                )
+            ],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=_transforms.Group(inputs=[_transforms.IdentityTransform()]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=True,
+        )
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
     finetuning_collected_demos_dir: str | None = None
     # Path to a preprocessed LIBERO RICL corpus. Only used by RICL-LIBERO configs.
     ricl_corpus_dir: str | None = None
+    # Path to a preprocessed LeRobot split-action RICL corpus.
+    lerobot_ricl_corpus_dir: str | None = None
+    # Legacy alias for older PNP commands.
+    pnp_eggplant_ricl_corpus_dir: str | None = None
     # Project name.
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
@@ -672,6 +725,95 @@ _CONFIGS = [
         save_interval=1_000,
         keep_period=1_000,
         lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=30_000, decay_lr=2.5e-6),
+    ),
+    #
+    # RICL on LeRobot split-action datasets. The 20-D source action is reduced
+    # to 16-D and the lift joint is removed from the source state.
+    #
+    TrainConfig(
+        name="pi0_fast_lerobot_ricl",
+        lerobot_ricl_corpus_dir="../../data/processed/lerobot_ricl_90_10",
+        model=pi0_fast_ricl.Pi0FASTRiclConfig(
+            action_dim=16,
+            action_horizon=10,
+            max_token_len=250,
+            num_retrieved_observations=4,
+            use_action_interpolation=True,
+            lamda=10.0,
+        ),
+        data=RiclLeRobotDataConfig(
+            repo_id="lerobot_ricl",
+            assets=AssetsConfig(
+                assets_dir="../../data/processed/lerobot_ricl_90_10",
+                asset_id="norm_stats",
+            ),
+            base_config=DataConfig(prompt_from_task=False, local_files_only=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=16,
+        freeze_filter=pi0_fast_ricl.Pi0FASTRiclConfig(
+            action_dim=16,
+            action_horizon=10,
+            max_token_len=250,
+            num_retrieved_observations=4,
+        ).get_freeze_filter_with_frozen_img_encoder(),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=1_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+    ),
+    #
+    # Legacy name for earlier PNP commands and checkpoints.
+    #
+    TrainConfig(
+        name="pi0_fast_pnp_eggplant_ricl",
+        lerobot_ricl_corpus_dir="../../data/processed/pnp_eggplant_ricl_90_10",
+        model=pi0_fast_ricl.Pi0FASTRiclConfig(
+            action_dim=16,
+            action_horizon=10,
+            max_token_len=250,
+            num_retrieved_observations=4,
+            use_action_interpolation=True,
+            lamda=10.0,
+        ),
+        data=RiclLeRobotDataConfig(
+            repo_id="pnp_eggplant_ricl",
+            assets=AssetsConfig(
+                assets_dir="../../data/processed/pnp_eggplant_ricl_90_10",
+                asset_id="norm_stats",
+            ),
+            base_config=DataConfig(prompt_from_task=False, local_files_only=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=16,
+        freeze_filter=pi0_fast_ricl.Pi0FASTRiclConfig(
+            action_dim=16,
+            action_horizon=10,
+            max_token_len=250,
+            num_retrieved_observations=4,
+        ).get_freeze_filter_with_frozen_img_encoder(),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=1_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
     ),
     #
     # Fine-tuning Libero configs.

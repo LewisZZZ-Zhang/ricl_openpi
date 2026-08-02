@@ -22,6 +22,35 @@ def _write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
     temporary_path.replace(path)
 
 
+def per_task_metrics(merged: dict[str, Any]) -> dict[str, Any]:
+    tasks = []
+    for suite_name, suite in merged["suites"].items():
+        for task in suite["tasks"]:
+            tasks.append(
+                {
+                    "suite": suite_name,
+                    "task_global_index": int(task["task_global_index"]),
+                    "task_index": int(task["task_index"]),
+                    "task_id": int(task["task_id"]),
+                    "task_name": task["task_name"],
+                    "episodes": int(task["episodes"]),
+                    "successes": int(task["successes"]),
+                    "success_rate": float(task["success_rate"]),
+                }
+            )
+
+    tasks.sort(key=lambda task: int(task["task_global_index"]))
+    return {
+        "status": merged["status"],
+        "started_at": merged["started_at"],
+        "completed_at": merged["completed_at"],
+        "updated_at": _timestamp(),
+        "config": merged["config"],
+        "overall": merged["overall"],
+        "tasks": tasks,
+    }
+
+
 def _load_shards(shards_dir: pathlib.Path, num_shards: int) -> list[tuple[pathlib.Path, dict[str, Any]]]:
     shards = []
     for shard_index in range(num_shards):
@@ -141,10 +170,13 @@ def main() -> None:
     merged = merge_metrics(args.shards_dir.expanduser(), args.num_shards)
     output_path = args.output_path.expanduser()
     _write_json(output_path, merged)
+    per_task_output_path = output_path.with_name("per_task_metrics.json")
+    _write_json(per_task_output_path, per_task_metrics(merged))
     print(
         f"Merged {merged['overall']['tasks']} tasks and {merged['overall']['episodes']} episodes "
         f"from {args.num_shards} shards into {output_path.resolve()}"
     )
+    print(f"Wrote per-task metrics to {per_task_output_path.resolve()}")
 
 
 if __name__ == "__main__":

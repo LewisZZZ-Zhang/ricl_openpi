@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import json
 import multiprocessing
 import os
 import typing
@@ -14,8 +15,8 @@ import openpi.models.model as _model
 import openpi.models.pi0_fast_ricl as _pi0_fast_ricl
 import openpi.training.config as _config
 import openpi.transforms as _transforms
+from openpi.training.lerobot_ricl_dataset import RiclLeRobotDataset
 from openpi.training.libero_ricl_dataset import RiclLiberoDataset
-import json
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -372,7 +373,16 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
 
     is_ricl = isinstance(config.model, _pi0_fast_ricl.Pi0FASTRiclConfig)
-    if is_ricl and config.ricl_corpus_dir is not None:
+    lerobot_ricl_corpus_dir = config.lerobot_ricl_corpus_dir or config.pnp_eggplant_ricl_corpus_dir
+    if is_ricl and lerobot_ricl_corpus_dir is not None:
+        dataset = RiclLeRobotDataset(
+            lerobot_ricl_corpus_dir,
+            num_retrieved_observations=config.model.num_retrieved_observations,
+            action_horizon=config.model.action_horizon,
+            use_action_interpolation=config.model.use_action_interpolation,
+            lamda=config.model.lamda,
+        )
+    elif is_ricl and config.ricl_corpus_dir is not None:
         dataset = RiclLiberoDataset(
             config.ricl_corpus_dir,
             num_retrieved_observations=config.model.num_retrieved_observations,
