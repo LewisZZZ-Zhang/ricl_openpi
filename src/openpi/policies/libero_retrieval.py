@@ -1,4 +1,11 @@
-"""Shared LIBERO-100 retrieval-corpus access for RICL training and inference."""
+"""Shared LIBERO-100 retrieval-corpus access for RICL training and inference.
+
+The original corpus format stores DINO embeddings.  Format version 2 also
+supports scalar task-progress banks.  Progress retrieval deliberately chooses
+at most one frame from each context demonstration: a one-dimensional progress
+coordinate otherwise makes adjacent frames from one trajectory dominate the
+top-k results.
+"""
 
 from __future__ import annotations
 
@@ -59,6 +66,92 @@ class ContextBank:
         return np.sqrt(squared_distances[ordered]), ordered.astype(np.int32, copy=False)
 
 
+def relative_progress_values(length: int) -> np.ndarray:
+    """Return the canonical per-demonstration progress coordinate in ``[0, 1]``."""
+    if length <= 0:
+        raise ValueError("A demonstration must contain at least one frame")
+    if length == 1:
+        return np.ones(1, dtype=np.float32)
+    return np.linspace(0.0, 1.0, length, dtype=np.float32)
+
+
+def progress_neighbors(
+    query_progress: np.ndarray | float,
+    context_progress: np.ndarray,
+    context_demo_indices: np.ndarray,
+    k: int,
+    *,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select progress-nearest frames with uniform random tie-breaking.
+
+    Returns bank indices with shape ``[num_queries, k]`` and RICL-compatible
+    relative distances with shape ``[num_queries, k + 1]``.  The first ``k``
+    distances are measured from the first retrieved frame and the last value is
+    the query-to-first distance, matching the legacy DINO corpus contract.
+
+    At most one frame is selected from each context demo. Frames tied inside a
+    demo and demos tied at the selection boundary have equal probability.
+    """
+    queries = np.asarray(query_progress, dtype=np.float32).reshape(-1)
+    progress = np.asarray(context_progress, dtype=np.float32).reshape(-1)
+    demo_indices = np.asarray(context_demo_indices, dtype=np.int32).reshape(-1)
+    if len(progress) != len(demo_indices):
+        raise ValueError("Context progress and demo-index arrays do not align")
+    if not np.isfinite(queries).all() or not np.isfinite(progress).all():
+        raise ValueError("Progress values must be finite")
+    if np.any((queries < 0.0) | (queries > 1.0)) or np.any((progress < 0.0) | (progress > 1.0)):
+        raise ValueError("Progress values must lie in [0, 1]")
+    unique_demos = np.unique(demo_indices)
+    if not 0 < k <= len(unique_demos):
+        raise ValueError(f"Requested {k} progress neighbors from only {len(unique_demos)} context demos")
+    rng = rng or np.random.default_rng()
+
+    selected = np.empty((len(queries), k), dtype=np.int32)
+    relative = np.empty((len(queries), k + 1), dtype=np.float32)
+    for query_index, query_value in enumerate(queries):
+        candidates: list[tuple[float, float, int]] = []
+        for demo_index in unique_demos:
+            bank_indices = np.flatnonzero(demo_indices == demo_index)
+            demo_distances = np.abs(progress[bank_indices] - query_value)
+            min_distance = float(demo_distances.min())
+            tied_local_indices = np.flatnonzero(demo_distances == min_distance)
+            local_index = int(rng.choice(tied_local_indices))
+            candidates.append((min_distance, float(rng.random()), int(bank_indices[local_index])))
+        candidates.sort()
+        row_array = np.asarray([candidate[2] for candidate in candidates[:k]], dtype=np.int32)
+        selected[query_index] = row_array
+        first_progress = float(progress[row_array[0]])
+        relative[query_index, :k] = np.abs(progress[row_array] - first_progress)
+        relative[query_index, k] = abs(float(query_value) - first_progress)
+    return selected, relative
+
+
+@dataclass(frozen=True)
+class ProgressContextBank:
+    progress: np.ndarray
+    demo_indices: np.ndarray
+    step_indices: np.ndarray
+
+    def search(
+        self,
+        query_progress: float,
+        k: int,
+        *,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        indices, _ = progress_neighbors(
+            query_progress,
+            self.progress,
+            self.demo_indices,
+            k,
+            rng=rng,
+        )
+        bank_indices = indices[0]
+        distances = np.abs(self.progress[bank_indices] - float(query_progress)).astype(np.float32)
+        return distances, bank_indices
+
+
 class LiberoRiclCorpus:
     """Read-only retrieval corpus backed by the original LIBERO HDF5 demonstrations."""
 
@@ -71,10 +164,20 @@ class LiberoRiclCorpus:
                 "Run preprocessing/build_libero_ricl_corpus.py first."
             )
         self.metadata: dict[str, Any] = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if self.metadata.get("format_version") != 1:
+        if self.metadata.get("format_version") not in (1, 2):
             raise ValueError(f"Unsupported RICL LIBERO corpus format: {self.metadata.get('format_version')}")
+        if self.retrieval_backend == "progress":
+            if self.metadata.get("progress_semantics") != "per_demo_relative_progress_v1":
+                raise ValueError(
+                    "Progress retrieval requires progress_semantics='per_demo_relative_progress_v1'"
+                )
+            if self.metadata.get("progress_range") != [0.0, 1.0]:
+                raise ValueError("Progress retrieval requires progress_range=[0.0, 1.0]")
+            if self.metadata.get("progress_tie_break") != "uniform_random_v1":
+                raise ValueError("Progress retrieval requires progress_tie_break='uniform_random_v1'")
         self.tasks = {int(task["task_id"]): task for task in self.metadata["tasks"]}
         self._banks: dict[int, ContextBank] = {}
+        self._progress_banks: dict[int, ProgressContextBank] = {}
         self._h5_files: dict[str, h5py.File] = {}
         self._actions: dict[tuple[str, str], np.ndarray] = {}
 
@@ -84,7 +187,17 @@ class LiberoRiclCorpus:
 
     @property
     def embedding_type(self) -> str:
+        if self.retrieval_backend != "dino":
+            raise ValueError("A progress retrieval corpus has no DINO embedding type")
         return str(self.metadata["embedding_type"])
+
+    @property
+    def retrieval_backend(self) -> str:
+        # Version-1 corpora predate the explicit field and are always DINO.
+        backend = str(self.metadata.get("retrieval_backend", "dino"))
+        if backend not in {"dino", "progress"}:
+            raise ValueError(f"Unsupported LIBERO retrieval backend: {backend!r}")
+        return backend
 
     def task(self, task_id: int) -> dict[str, Any]:
         try:
@@ -94,6 +207,8 @@ class LiberoRiclCorpus:
             raise KeyError(f"Unknown LIBERO retrieval task {task_id}; available task ids: {known}") from exc
 
     def context_bank(self, task_id: int) -> ContextBank:
+        if self.retrieval_backend != "dino":
+            raise ValueError("context_bank() is only available for DINO retrieval corpora")
         task_id = int(task_id)
         if task_id not in self._banks:
             task = self.task(task_id)
@@ -107,12 +222,47 @@ class LiberoRiclCorpus:
             self._banks[task_id] = ContextBank(embeddings, demo_indices, step_indices)
         return self._banks[task_id]
 
+    def progress_bank(self, task_id: int) -> ProgressContextBank:
+        if self.retrieval_backend != "progress":
+            raise ValueError("progress_bank() is only available for progress retrieval corpora")
+        task_id = int(task_id)
+        if task_id not in self._progress_banks:
+            task = self.task(task_id)
+            progress_path = task.get("context_progress_path")
+            if not progress_path:
+                raise ValueError(f"Progress corpus task {task_id} has no context_progress_path")
+            progress = np.asarray(np.load(self.root / progress_path, mmap_mode="r"), dtype=np.float32)
+            demo_indices, step_indices = self._load_context_refs(task_id)
+            if len(progress) != len(demo_indices):
+                raise ValueError(f"Corrupt progress context bank for task {task_id}")
+            self._progress_banks[task_id] = ProgressContextBank(progress, demo_indices, step_indices)
+        return self._progress_banks[task_id]
+
+    def _load_context_refs(self, task_id: int) -> tuple[np.ndarray, np.ndarray]:
+        task = self.task(task_id)
+        with np.load(self.root / task["context_refs_path"], allow_pickle=False) as refs:
+            demo_indices = np.asarray(refs["demo_indices"], dtype=np.int32)
+            step_indices = np.asarray(refs["step_indices"], dtype=np.int32)
+        if len(demo_indices) != len(step_indices):
+            raise ValueError(f"Corrupt context references for task {task_id}")
+        return demo_indices, step_indices
+
     def search(self, task_id: int, query_embedding: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         return self.context_bank(task_id).search(query_embedding, k)
 
+    def search_progress(
+        self,
+        task_id: int,
+        query_progress: float,
+        k: int,
+        *,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self.progress_bank(task_id).search(float(query_progress), k, rng=rng)
+
     def retrieved_ref(self, task_id: int, bank_index: int) -> tuple[str, int]:
         task = self.task(task_id)
-        bank = self.context_bank(task_id)
+        bank = self.context_bank(task_id) if self.retrieval_backend == "dino" else self.progress_bank(task_id)
         demo_index = int(bank.demo_indices[bank_index])
         context_demo_ids = task["context_demo_ids"]
         if not 0 <= demo_index < len(context_demo_ids):

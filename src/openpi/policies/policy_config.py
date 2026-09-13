@@ -135,6 +135,7 @@ def create_trained_libero_ricl_policy(
     checkpoint_dir: str,
     corpus_dir: str,
     norm_stats: dict[str, transforms.NormStats] | None = None,
+    progress_predictor: Any | None = None,
 ) -> _policy.RiclLiberoPolicy:
     """Create a RICL policy backed by a task-scoped LIBERO-100 retrieval corpus."""
     logging.info("Loading RICL-LIBERO model...")
@@ -162,4 +163,5 @@ def create_trained_libero_ricl_policy(
         use_action_interpolation=train_config.model.use_action_interpolation,
         lamda=train_config.model.lamda,
         action_horizon=train_config.model.action_horizon,
+        progress_predictor=progress_predictor,
     )

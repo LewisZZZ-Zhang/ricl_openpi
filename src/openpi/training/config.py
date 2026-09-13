@@ -519,6 +519,9 @@ class TrainConfig:
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
+    # Optional complete checkpoint directory used to initialize a fresh run.
+    # Unlike resume, this loads only params and resets step/optimizer state.
+    init_checkpoint_dir: str | None = None
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -589,6 +592,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.resume and self.init_checkpoint_dir:
+            raise ValueError("Cannot combine resume with init_checkpoint_dir; choose exact resume or a fresh run.")
 
 
 # Use `get_config` if you need to get a config by name in your code.

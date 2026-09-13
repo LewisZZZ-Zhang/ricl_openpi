@@ -228,6 +228,21 @@ def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
+    if config.init_checkpoint_dir:
+        init_checkpoint_dir = epath.Path(config.init_checkpoint_dir).expanduser().resolve()
+        if not (init_checkpoint_dir / "_CHECKPOINT_METADATA").exists():
+            raise FileNotFoundError(f"Incomplete initialization checkpoint: {init_checkpoint_dir}")
+        if not (init_checkpoint_dir / "params").exists():
+            raise FileNotFoundError(f"Initialization checkpoint has no params: {init_checkpoint_dir}")
+        config = dataclasses.replace(
+            config,
+            weight_loader=_weight_loaders.CheckpointWeightLoader(str(init_checkpoint_dir / "params")),
+        )
+        logging.info(
+            "Initializing a fresh run from %s (optimizer and step are reset)",
+            init_checkpoint_dir,
+        )
+
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."

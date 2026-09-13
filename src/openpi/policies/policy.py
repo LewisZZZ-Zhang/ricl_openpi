@@ -260,6 +260,7 @@ class RiclLiberoPolicy(BasePolicy):
         use_action_interpolation: bool,
         lamda: float,
         action_horizon: int,
+        progress_predictor: Any | None = None,
     ):
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
         self._input_transform = _transforms.compose(transforms)
@@ -278,19 +279,49 @@ class RiclLiberoPolicy(BasePolicy):
         self._use_action_interpolation = use_action_interpolation
         self._lamda = lamda
         self._action_horizon = action_horizon
-        logger.info("Loading DINOv2 retrieval encoder for LIBERO corpus: %s", corpus_dir)
-        self._dinov2 = load_dinov2()
+        self._progress_predictor = progress_predictor
+        self._progress_rng = np.random.default_rng(int(self._corpus.metadata.get("retrieval_seed", 0)))
+        self._dinov2 = None
+        if self._corpus.retrieval_backend == "dino":
+            logger.info("Loading DINOv2 retrieval encoder for LIBERO corpus: %s", corpus_dir)
+            self._dinov2 = load_dinov2()
+        else:
+            logger.info("Using progress retrieval for LIBERO corpus: %s", corpus_dir)
+
+    def _predict_progress(self, obs: dict, task_id: int) -> float:
+        if "query_progress" in obs:
+            progress = float(np.asarray(obs["query_progress"]).item())
+        elif self._progress_predictor is not None:
+            progress = float(self._progress_predictor.predict(obs, task_id))
+        else:
+            raise KeyError(
+                "Progress retrieval requires query_progress in the request or a configured VFE progress predictor"
+            )
+        if not np.isfinite(progress):
+            raise ValueError(f"Predicted query progress must be finite, got {progress}")
+        return float(np.clip(progress, 0.0, 1.0))
 
     def retrieve(self, obs: dict) -> dict:
         if "retrieval_task_id" not in obs:
             raise KeyError("RICL-LIBERO inference requires a stable retrieval_task_id")
         task_id = int(np.asarray(obs["retrieval_task_id"]).item())
-        query_embedding = embed(
-            obs["query_top_image"], self._dinov2, embedding_type=self._corpus.embedding_type
-        )
-        if query_embedding.shape[0] != 1:
-            raise ValueError(f"Expected one query image, got embedding shape {query_embedding.shape}")
-        _, bank_indices = self._corpus.search(task_id, query_embedding[0], self._knn_k)
+        query_embedding = None
+        query_progress = None
+        if self._corpus.retrieval_backend == "dino":
+            query_embedding = embed(
+                obs["query_top_image"], self._dinov2, embedding_type=self._corpus.embedding_type
+            )
+            if query_embedding.shape[0] != 1:
+                raise ValueError(f"Expected one query image, got embedding shape {query_embedding.shape}")
+            _, bank_indices = self._corpus.search(task_id, query_embedding[0], self._knn_k)
+        else:
+            query_progress = self._predict_progress(obs, task_id)
+            _, bank_indices = self._corpus.search_progress(
+                task_id,
+                query_progress,
+                self._knn_k,
+                rng=self._progress_rng,
+            )
         task = self._corpus.task(task_id)
         retrieved: dict[str, Any] = {"inference_time": True}
         for retrieved_number, bank_index in enumerate(bank_indices):
@@ -304,15 +335,36 @@ class RiclLiberoPolicy(BasePolicy):
             retrieved[f"{prefix}prompt"] = task["prompt"]
 
         if self._use_action_interpolation:
-            bank = self._corpus.context_bank(task_id)
-            retrieved_embeddings = bank.embeddings[bank_indices]
-            first_embedding = retrieved_embeddings[0]
             relative_distances = [0.0]
-            relative_distances.extend(np.linalg.norm(embedding - first_embedding) for embedding in retrieved_embeddings[1:])
-            relative_distances.append(np.linalg.norm(query_embedding[0] - first_embedding))
+            if self._corpus.retrieval_backend == "dino":
+                bank = self._corpus.context_bank(task_id)
+                retrieved_embeddings = bank.embeddings[bank_indices]
+                first_embedding = retrieved_embeddings[0]
+                relative_distances.extend(
+                    np.linalg.norm(embedding - first_embedding) for embedding in retrieved_embeddings[1:]
+                )
+                relative_distances.append(np.linalg.norm(query_embedding[0] - first_embedding))
+            else:
+                bank = self._corpus.progress_bank(task_id)
+                retrieved_progress = bank.progress[bank_indices]
+                first_progress = float(retrieved_progress[0])
+                relative_distances.extend(abs(float(progress) - first_progress) for progress in retrieved_progress[1:])
+                relative_distances.append(abs(float(query_progress) - first_progress))
             normalized = np.clip(np.asarray(relative_distances), 0, self._corpus.max_distance) / self._corpus.max_distance
             retrieved["exp_lamda_distances"] = np.exp(-self._lamda * normalized).reshape(-1, 1)
-        return {**obs, **retrieved}
+        policy_obs = {
+            key: value
+            for key, value in obs.items()
+            if key
+            not in {
+                "query_progress",
+                "retrieval_task_id",
+                "retrieval_episode_id",
+                "retrieval_timestep",
+            }
+            and not key.startswith("vfe_")
+        }
+        return {**policy_obs, **retrieved}
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]

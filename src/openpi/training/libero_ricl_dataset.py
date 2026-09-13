@@ -77,6 +77,11 @@ class RiclLiberoDataset:
         bank_indices = neighbors["retrieved_bank_indices"][sample.step_idx]
         if bank_indices.shape != (self.num_retrieved_observations,):
             raise ValueError(f"Unexpected neighbour shape {bank_indices.shape}")
+        if self.corpus.retrieval_backend == "progress":
+            bank = self.corpus.progress_bank(sample.task_id)
+            retrieved_demo_indices = bank.demo_indices[bank_indices]
+            if len(np.unique(retrieved_demo_indices)) != len(retrieved_demo_indices):
+                raise ValueError("Progress retrieval must select at most one frame from each context demo")
 
         task = self.corpus.task(sample.task_id)
         data: dict[str, object] = {}

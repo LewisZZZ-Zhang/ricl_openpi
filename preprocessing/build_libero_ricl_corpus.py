@@ -1,9 +1,10 @@
-"""Build a task-scoped DINO retrieval corpus for RICL on LIBERO-100.
+"""Build a task-scoped DINO or progress retrieval corpus for RICL on LIBERO-100.
 
-The corpus stores only DINO embeddings and frame references. Images, states, and
-actions continue to live in the original LIBERO HDF5 files, so the data is not
-duplicated. Training neighbours are selected exclusively from a task's context
-demos; query and context episode sets must therefore be disjoint.
+Images, states, and actions continue to live in the original LIBERO HDF5 files,
+so the data is not duplicated. Training neighbours are selected exclusively
+from a task's context demos; query and context episode sets must therefore be
+disjoint. Progress corpora use the same versioned labels as VFE instead of
+reconstructing a second definition of ground truth.
 """
 
 from __future__ import annotations
@@ -18,7 +19,10 @@ from typing import Any
 import h5py
 import numpy as np
 
-from openpi.policies.utils import embed_with_batches, embedding_dim, load_dinov2
+from openpi.policies.libero_retrieval import progress_neighbors
+
+
+PROGRESS_SEMANTICS = "per_demo_relative_progress_v1"
 
 
 @dataclass(frozen=True)
@@ -152,6 +156,8 @@ def _manifest_splits(manifest_path: Path) -> list[TaskSplit]:
 
 
 def _embed_images(images: np.ndarray, dinov2: Any, embedding_type: str, batch_size: int) -> np.ndarray:
+    from openpi.policies.utils import embed_with_batches
+
     images = np.ascontiguousarray(images[:, ::-1, ::-1])
     embeddings = embed_with_batches(images, dinov2, batch_size=batch_size, embedding_type=embedding_type)
     return np.asarray(embeddings, dtype=np.float32)
@@ -177,6 +183,81 @@ def _neighbors(query_embeddings: np.ndarray, context_embeddings: np.ndarray, k: 
     return nearest, relative
 
 
+def _label_path(progress_labels_dir: Path, task_id: int, demo_id: str) -> Path:
+    return progress_labels_dir / f"task_{task_id:03d}" / f"{demo_id}.npz"
+
+
+def _load_gt_progress(
+    progress_labels_dir: Path,
+    task_id: int,
+    demo_id: str,
+    expected_length: int,
+) -> tuple[np.ndarray, str]:
+    path = _label_path(progress_labels_dir, task_id, demo_id)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing VFE progress labels: {path}")
+    with np.load(path, allow_pickle=False) as payload:
+        values = np.asarray(payload["value_continuous"], dtype=np.float32)
+        value_min = float(payload["value_min"])
+        value_max = float(payload["value_max"])
+        recorded_task_id = int(payload["task_id"])
+        recorded_demo_id = str(payload["demo_id"])
+        recorded_preset = str(payload["data_split_preset"])
+    if recorded_task_id != task_id or recorded_demo_id != demo_id:
+        raise ValueError(f"Progress-label identity mismatch in {path}")
+    if values.shape != (expected_length,):
+        raise ValueError(f"Progress labels in {path} have shape {values.shape}; expected ({expected_length},)")
+    if not np.isfinite(values).all() or value_max <= value_min:
+        raise ValueError(f"Invalid progress labels in {path}")
+    progress = (values - value_min) / (value_max - value_min)
+    if np.any((progress < -1e-6) | (progress > 1.0 + 1e-6)):
+        raise ValueError(f"Progress labels in {path} fall outside their recorded range")
+    # Exact endpoints are part of the per-demo relative-progress contract.
+    if expected_length == 1:
+        endpoints_ok = np.isclose(progress[0], 1.0)
+    else:
+        endpoints_ok = np.isclose(progress[0], 0.0) and np.isclose(progress[-1], 1.0)
+    if not endpoints_ok:
+        raise ValueError(
+            f"{path} is not {PROGRESS_SEMANTICS}: expected per-demo progress endpoints, "
+            f"got first={progress[0]} last={progress[-1]}"
+        )
+    return np.clip(progress, 0.0, 1.0).astype(np.float32), recorded_preset
+
+
+def _load_cached_query_progress(
+    cache_dir: Path,
+    task_id: int,
+    demo_id: str,
+    expected_length: int,
+) -> np.ndarray:
+    candidates = (
+        cache_dir / f"task_{task_id:03d}" / f"{demo_id}.npz",
+        cache_dir / f"task_{task_id:03d}_{demo_id}.npz",
+    )
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
+        raise FileNotFoundError(f"Missing cached query progress; tried: {', '.join(map(str, candidates))}")
+    with np.load(path, allow_pickle=False) as payload:
+        if "progress" in payload:
+            progress = np.asarray(payload["progress"], dtype=np.float32)
+        elif "prediction_progress" in payload:
+            progress = np.asarray(payload["prediction_progress"], dtype=np.float32)
+        elif "prediction" in payload:
+            # Native VFE scalar values use [-1, 0].
+            progress = np.asarray(payload["prediction"], dtype=np.float32) + 1.0
+        else:
+            raise KeyError(f"{path} must contain progress, prediction_progress, or prediction")
+        timesteps = np.asarray(payload["timesteps"], dtype=np.int64) if "timesteps" in payload else None
+    if progress.shape != (expected_length,):
+        raise ValueError(f"Cached progress in {path} has shape {progress.shape}; expected ({expected_length},)")
+    if timesteps is not None and not np.array_equal(timesteps, np.arange(expected_length, dtype=np.int64)):
+        raise ValueError(f"Cached progress in {path} does not contain one prediction for every frame")
+    if not np.isfinite(progress).all():
+        raise ValueError(f"Cached progress in {path} contains non-finite values")
+    return np.clip(progress, 0.0, 1.0).astype(np.float32)
+
+
 def build_corpus(
     *,
     dataset_root: Path,
@@ -188,25 +269,60 @@ def build_corpus(
     embedding_type: str,
     embedding_batch_size: int,
     context_demos: int,
+    retrieval_backend: str = "dino",
+    progress_labels_dir: Path | None = None,
+    query_progress_source: str = "gt",
+    query_progress_cache: Path | None = None,
+    retrieval_seed: int = 0,
 ) -> dict[str, Any]:
     if num_retrieved <= 0:
         raise ValueError("num_retrieved must be positive")
     if action_horizon <= 0:
         raise ValueError("action_horizon must be positive")
-    embedding_dim(embedding_type)  # validate before beginning a long DINO run
+    if retrieval_backend not in {"dino", "progress"}:
+        raise ValueError("retrieval_backend must be 'dino' or 'progress'")
+    if query_progress_source not in {"gt", "cache"}:
+        raise ValueError("query_progress_source must be 'gt' or 'cache'")
+    if retrieval_backend == "progress":
+        if progress_labels_dir is None:
+            raise ValueError("--progress-labels-dir is required for progress retrieval")
+        progress_labels_dir = progress_labels_dir.expanduser().resolve()
+        if not progress_labels_dir.is_dir():
+            raise FileNotFoundError(f"Progress-label directory not found: {progress_labels_dir}")
+        if query_progress_source == "cache":
+            if query_progress_cache is None:
+                raise ValueError("--query-progress-cache is required when --query-progress-source=cache")
+            query_progress_cache = query_progress_cache.expanduser().resolve()
+            if not query_progress_cache.is_dir():
+                raise FileNotFoundError(f"Query-progress cache not found: {query_progress_cache}")
+    elif query_progress_source != "gt" or query_progress_cache is not None:
+        raise ValueError("Query-progress source/cache options are only valid for progress retrieval")
+
+    embedding_size: int | None = None
+    dinov2: Any | None = None
+    progress_rng: np.random.Generator | None = None
+    if retrieval_backend == "dino":
+        from openpi.policies.utils import embedding_dim, load_dinov2
+
+        embedding_size = embedding_dim(embedding_type)  # validate before beginning a long DINO run
+        dinov2 = load_dinov2()
+    else:
+        progress_rng = np.random.default_rng(retrieval_seed)
 
     task_splits = (
-        _manifest_splits(split_manifest.resolve()) if split_manifest is not None else _default_splits(dataset_root, libero_root, context_demos)
+        _manifest_splits(split_manifest.resolve())
+        if split_manifest is not None
+        else _default_splits(dataset_root, libero_root, context_demos)
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    embeddings_dir = output_dir / "embeddings"
+    banks_dir = output_dir / ("embeddings" if retrieval_backend == "dino" else "progress")
     neighbors_dir = output_dir / "neighbors"
-    embeddings_dir.mkdir(exist_ok=True)
+    banks_dir.mkdir(exist_ok=True)
     neighbors_dir.mkdir(exist_ok=True)
 
-    dinov2 = load_dinov2()
     metadata_tasks: list[dict[str, Any]] = []
     max_distance = 0.0
+    progress_data_split_preset: str | None = None
     for task_position, split in enumerate(task_splits, start=1):
         if set(split.context_demo_ids).intersection(split.query_demo_ids):
             raise ValueError(f"Task {split.task_id} has overlapping context and query demos")
@@ -218,24 +334,39 @@ def build_corpus(
             if missing:
                 raise KeyError(f"Task {split.task_id} references absent demos: {missing}")
 
-            context_embeddings: list[np.ndarray] = []
+            context_features: list[np.ndarray] = []
             context_demo_indices: list[np.ndarray] = []
             context_step_indices: list[np.ndarray] = []
             for demo_index, demo_id in enumerate(split.context_demo_ids):
-                images = h5_file[f"data/{demo_id}/obs/agentview_rgb"][:]
-                embeddings = _embed_images(images, dinov2, embedding_type, embedding_batch_size)
-                context_embeddings.append(embeddings)
-                context_demo_indices.append(np.full(len(embeddings), demo_index, dtype=np.int32))
-                context_step_indices.append(np.arange(len(embeddings), dtype=np.int32))
-            all_context_embeddings = np.concatenate(context_embeddings, axis=0)
+                demo_length = len(h5_file[f"data/{demo_id}/actions"])
+                if retrieval_backend == "dino":
+                    images = h5_file[f"data/{demo_id}/obs/agentview_rgb"][:]
+                    features = _embed_images(images, dinov2, embedding_type, embedding_batch_size)
+                else:
+                    features, label_preset = _load_gt_progress(
+                        progress_labels_dir, split.task_id, demo_id, demo_length
+                    )
+                    if progress_data_split_preset is None:
+                        progress_data_split_preset = label_preset
+                    elif label_preset != progress_data_split_preset:
+                        raise ValueError(
+                            f"Mixed VFE data-split presets in progress labels: "
+                            f"{progress_data_split_preset!r} and {label_preset!r}"
+                        )
+                context_features.append(features)
+                context_demo_indices.append(np.full(demo_length, demo_index, dtype=np.int32))
+                context_step_indices.append(np.arange(demo_length, dtype=np.int32))
+            all_context_features = np.concatenate(context_features, axis=0)
             all_context_demo_indices = np.concatenate(context_demo_indices, axis=0)
             all_context_step_indices = np.concatenate(context_step_indices, axis=0)
 
-            task_dir = embeddings_dir / f"task_{split.task_id:03d}"
+            task_dir = banks_dir / f"task_{split.task_id:03d}"
             task_dir.mkdir(exist_ok=True)
-            embeddings_path = task_dir / "context_embeddings.npy"
+            bank_path = task_dir / (
+                "context_embeddings.npy" if retrieval_backend == "dino" else "context_progress.npy"
+            )
             refs_path = task_dir / "context_refs.npz"
-            np.save(embeddings_path, all_context_embeddings.astype(np.float32))
+            np.save(bank_path, all_context_features.astype(np.float32))
             np.savez_compressed(
                 refs_path,
                 demo_indices=all_context_demo_indices,
@@ -247,50 +378,101 @@ def build_corpus(
                 task_neighbors_dir = neighbors_dir / f"task_{split.task_id:03d}"
                 task_neighbors_dir.mkdir(exist_ok=True)
                 for demo_id in split.query_demo_ids:
-                    query_images = h5_file[f"data/{demo_id}/obs/agentview_rgb"][:]
-                    query_embeddings = _embed_images(query_images, dinov2, embedding_type, embedding_batch_size)
-                    neighbor_indices, relative_distances = _neighbors(query_embeddings, all_context_embeddings, num_retrieved)
+                    demo_length = len(h5_file[f"data/{demo_id}/actions"])
+                    if retrieval_backend == "dino":
+                        query_images = h5_file[f"data/{demo_id}/obs/agentview_rgb"][:]
+                        query_features = _embed_images(query_images, dinov2, embedding_type, embedding_batch_size)
+                        neighbor_indices, relative_distances = _neighbors(
+                            query_features, all_context_features, num_retrieved
+                        )
+                    else:
+                        if query_progress_source == "gt":
+                            query_features, label_preset = _load_gt_progress(
+                                progress_labels_dir, split.task_id, demo_id, demo_length
+                            )
+                            if label_preset != progress_data_split_preset:
+                                raise ValueError(
+                                    f"Query label preset {label_preset!r} does not match context-label preset "
+                                    f"{progress_data_split_preset!r}"
+                                )
+                        else:
+                            query_features = _load_cached_query_progress(
+                                query_progress_cache, split.task_id, demo_id, demo_length
+                            )
+                        neighbor_indices, relative_distances = progress_neighbors(
+                            query_features,
+                            all_context_features,
+                            all_context_demo_indices,
+                            num_retrieved,
+                            rng=progress_rng,
+                        )
                     max_distance = max(max_distance, float(relative_distances.max()))
-                    np.savez_compressed(
-                        task_neighbors_dir / f"{demo_id}.npz",
-                        retrieved_bank_indices=neighbor_indices,
-                        relative_distances=relative_distances,
-                    )
+                    neighbor_payload: dict[str, np.ndarray] = {
+                        "retrieved_bank_indices": neighbor_indices,
+                        "relative_distances": relative_distances,
+                    }
+                    if retrieval_backend == "progress":
+                        neighbor_payload["query_progress"] = np.asarray(query_features, dtype=np.float32)
+                        neighbor_payload["retrieved_progress_distances"] = np.abs(
+                            all_context_features[neighbor_indices] - np.asarray(query_features)[:, None]
+                        ).astype(np.float32)
+                    np.savez_compressed(task_neighbors_dir / f"{demo_id}.npz", **neighbor_payload)
                 neighbors_rel_path = str(task_neighbors_dir.relative_to(output_dir))
 
-        metadata_tasks.append(
-            {
-                "task_id": split.task_id,
-                "suite": split.suite,
-                "task_name": split.task_name,
-                "prompt": split.prompt,
-                "source_hdf5": str(source_hdf5),
-                "context_demo_ids": split.context_demo_ids,
-                "query_demo_ids": split.query_demo_ids,
-                "is_train": split.is_train,
-                "context_embeddings_path": str(embeddings_path.relative_to(output_dir)),
-                "context_refs_path": str(refs_path.relative_to(output_dir)),
-                "neighbors_dir": neighbors_rel_path,
-            }
-        )
+        task_metadata = {
+            "task_id": split.task_id,
+            "suite": split.suite,
+            "task_name": split.task_name,
+            "prompt": split.prompt,
+            "source_hdf5": str(source_hdf5),
+            "context_demo_ids": split.context_demo_ids,
+            "query_demo_ids": split.query_demo_ids,
+            "is_train": split.is_train,
+            "context_refs_path": str(refs_path.relative_to(output_dir)),
+            "neighbors_dir": neighbors_rel_path,
+        }
+        task_metadata[
+            "context_embeddings_path" if retrieval_backend == "dino" else "context_progress_path"
+        ] = str(bank_path.relative_to(output_dir))
+        metadata_tasks.append(task_metadata)
         print(
             f"[{task_position}/{len(task_splits)}] task={split.task_id} "
-            f"context_frames={len(all_context_embeddings)} train={split.is_train}"
+            f"context_frames={len(all_context_features)} train={split.is_train} backend={retrieval_backend}"
         )
 
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "dataset": "LIBERO-100",
         "dataset_root": str(dataset_root.resolve()),
         "split_manifest": str(split_manifest.resolve()) if split_manifest is not None else None,
-        "embedding_type": embedding_type,
-        "embedding_dim": embedding_dim(embedding_type),
-        "embedding_storage_dtype": "float32",
+        "retrieval_backend": retrieval_backend,
         "num_retrieved": num_retrieved,
         "action_horizon": action_horizon,
         "max_distance": max(max_distance, np.finfo(np.float32).eps),
         "tasks": metadata_tasks,
     }
+    if retrieval_backend == "dino":
+        metadata.update(
+            {
+                "embedding_type": embedding_type,
+                "embedding_dim": embedding_size,
+                "embedding_storage_dtype": "float32",
+            }
+        )
+    else:
+        metadata.update(
+            {
+                "progress_semantics": PROGRESS_SEMANTICS,
+                "progress_range": [0.0, 1.0],
+                "progress_storage_dtype": "float32",
+                "progress_tie_break": "uniform_random_v1",
+                "retrieval_seed": retrieval_seed,
+                "progress_labels_dir": str(progress_labels_dir),
+                "progress_data_split_preset": progress_data_split_preset,
+                "query_progress_source": query_progress_source,
+                "query_progress_cache": str(query_progress_cache) if query_progress_cache is not None else None,
+            }
+        )
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metadata
 
@@ -306,6 +488,21 @@ def main() -> None:
     parser.add_argument("--embedding-type", choices=("CLS", "AVG", "16PATCHES", "64PATCHES"), default="CLS")
     parser.add_argument("--embedding-batch-size", type=int, default=256)
     parser.add_argument("--context-demos", type=int, default=10, help="Used only when --split-manifest is omitted.")
+    parser.add_argument("--retrieval-backend", choices=("dino", "progress"), default="dino")
+    parser.add_argument(
+        "--progress-labels-dir",
+        type=Path,
+        default=None,
+        help="VFE per_demo_relative_progress_v1 labels/task_XXX directory parent; required for progress retrieval.",
+    )
+    parser.add_argument(
+        "--query-progress-source",
+        choices=("gt", "cache"),
+        default="gt",
+        help="Use GT query progress now, or full-frame VFE predictions from --query-progress-cache later.",
+    )
+    parser.add_argument("--query-progress-cache", type=Path, default=None)
+    parser.add_argument("--retrieval-seed", type=int, default=0)
     args = parser.parse_args()
     metadata = build_corpus(
         dataset_root=args.dataset_root,
@@ -317,6 +514,11 @@ def main() -> None:
         embedding_type=args.embedding_type,
         embedding_batch_size=args.embedding_batch_size,
         context_demos=args.context_demos,
+        retrieval_backend=args.retrieval_backend,
+        progress_labels_dir=args.progress_labels_dir,
+        query_progress_source=args.query_progress_source,
+        query_progress_cache=args.query_progress_cache,
+        retrieval_seed=args.retrieval_seed,
     )
     print(f"Wrote {len(metadata['tasks'])} tasks to {args.output_dir / 'metadata.json'}")
 

@@ -10,6 +10,8 @@ import tyro
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
+from openpi.policies.libero_retrieval import LiberoRiclCorpus
+from openpi.policies.vfe_progress_client import VfeProgressClient
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
@@ -21,11 +23,24 @@ class Args:
     corpus_dir: str = tyro.MISSING
     port: int = 8000
     record: bool = False
+    vfe_host: str = "127.0.0.1"
+    vfe_port: int | None = None
 
 
 def main(args: Args) -> None:
+    corpus = LiberoRiclCorpus(args.corpus_dir)
+    retrieval_backend = corpus.retrieval_backend
+    corpus.close()
+    progress_predictor = None
+    if retrieval_backend == "progress":
+        if args.vfe_port is None:
+            raise ValueError("A progress retrieval corpus requires --vfe-port for online inference")
+        progress_predictor = VfeProgressClient(args.vfe_host, args.vfe_port)
     policy = _policy_config.create_trained_libero_ricl_policy(
-        _config.get_config(args.config), args.checkpoint_dir, args.corpus_dir
+        _config.get_config(args.config),
+        args.checkpoint_dir,
+        args.corpus_dir,
+        progress_predictor=progress_predictor,
     )
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")

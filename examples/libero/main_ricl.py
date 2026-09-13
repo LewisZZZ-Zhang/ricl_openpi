@@ -51,6 +51,7 @@ class Args:
     video_out_path: str = "data/libero/videos_ricl"
     save_videos: bool = True
     seed: int = 7
+    vfe_history_offsets: tuple[int, ...] = (0,)
 
 
 def _tasks_from_corpus(corpus_dir: str) -> dict[tuple[str, str], CorpusTask]:
@@ -129,6 +130,14 @@ def eval_libero(args: Args) -> None:
         pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
     client = websocket_policy.WebsocketClientPolicy(args.host, args.port)
     corpus_tasks = _tasks_from_corpus(args.corpus_dir)
+    corpus_metadata = json.loads(
+        (pathlib.Path(args.corpus_dir).expanduser() / "metadata.json").read_text(encoding="utf-8")
+    )
+    progress_retrieval = corpus_metadata.get("retrieval_backend", "dino") in {"progress", "dino_progress"}
+    if not args.vfe_history_offsets or args.vfe_history_offsets[-1] != 0:
+        raise ValueError("vfe_history_offsets must be non-empty and end at the current-frame offset 0")
+    if any(offset < 0 for offset in args.vfe_history_offsets):
+        raise ValueError("vfe_history_offsets must contain non-negative lookback offsets")
     benchmark_dict = benchmark.get_benchmark_dict()
 
     metrics = {
@@ -146,6 +155,7 @@ def eval_libero(args: Args) -> None:
             "num_trials_per_task": args.num_trials_per_task,
             "num_steps_wait": args.num_steps_wait,
             "replan_steps": args.replan_steps,
+            "vfe_history_offsets": list(args.vfe_history_offsets),
             "seed": args.seed,
         },
         "suites": {},
@@ -214,6 +224,9 @@ def eval_libero(args: Args) -> None:
                     obs = env.set_init_state(initial_states[episode_index])
                     action_plan: collections.deque[np.ndarray] = collections.deque()
                     replay_images: list[np.ndarray] = []
+                    vfe_top_history: list[np.ndarray] = []
+                    vfe_wrist_history: list[np.ndarray] = []
+                    vfe_proprio_history: list[np.ndarray] = []
                     done = False
                     timestep = 0
                     rollout_error = None
@@ -224,13 +237,19 @@ def eval_libero(args: Args) -> None:
                                 timestep += 1
                                 continue
 
-                            top_image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                            wrist_image = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                            vfe_top_image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                            vfe_wrist_image = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                            vfe_proprio = np.concatenate(
+                                (obs["robot0_joint_pos"], obs["robot0_gripper_qpos"])
+                            ).astype(np.float32)
+                            vfe_top_history.append(vfe_top_image)
+                            vfe_wrist_history.append(vfe_wrist_image)
+                            vfe_proprio_history.append(vfe_proprio)
                             top_image = image_tools.convert_to_uint8(
-                                image_tools.resize_with_pad(top_image, args.resize_size, args.resize_size)
+                                image_tools.resize_with_pad(vfe_top_image, args.resize_size, args.resize_size)
                             )
                             wrist_image = image_tools.convert_to_uint8(
-                                image_tools.resize_with_pad(wrist_image, args.resize_size, args.resize_size)
+                                image_tools.resize_with_pad(vfe_wrist_image, args.resize_size, args.resize_size)
                             )
                             if args.save_videos:
                                 replay_images.append(top_image)
@@ -248,7 +267,30 @@ def eval_libero(args: Args) -> None:
                                     ).astype(np.float32),
                                     "query_prompt": str(task_description),
                                     "retrieval_task_id": np.asarray(corpus_task.task_id, dtype=np.int32),
+                                    "retrieval_episode_id": np.asarray(episode_index, dtype=np.int32),
+                                    "retrieval_timestep": np.asarray(timestep, dtype=np.int32),
                                 }
+                                if progress_retrieval:
+                                    history_indices = [
+                                        max(0, len(vfe_top_history) - 1 - offset)
+                                        for offset in args.vfe_history_offsets
+                                    ]
+                                    request.update(
+                                        {
+                                            "vfe_query_top_image": vfe_top_image,
+                                            "vfe_query_wrist_image": vfe_wrist_image,
+                                            "vfe_query_proprio": vfe_proprio,
+                                            "vfe_query_top_history": np.stack(
+                                                [vfe_top_history[index] for index in history_indices]
+                                            ),
+                                            "vfe_query_wrist_history": np.stack(
+                                                [vfe_wrist_history[index] for index in history_indices]
+                                            ),
+                                            "vfe_query_proprio_history": np.stack(
+                                                [vfe_proprio_history[index] for index in history_indices]
+                                            ),
+                                        }
+                                    )
                                 action_chunk = client.infer(request)["actions"]
                                 if len(action_chunk) < args.replan_steps:
                                     raise ValueError(
