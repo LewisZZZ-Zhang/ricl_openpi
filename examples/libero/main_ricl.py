@@ -96,6 +96,9 @@ def _get_libero_env(task, resolution: int, seed: int):
         camera_widths=resolution,
     )
     env.seed(seed)
+    from OpenGL import GL
+
+    logging.info("OpenGL renderer: %s; vendor: %s", GL.glGetString(GL.GL_RENDERER), GL.glGetString(GL.GL_VENDOR))
     return env, task.language
 
 
@@ -220,6 +223,7 @@ def eval_libero(args: Args) -> None:
 
             try:
                 for episode_index in range(args.num_trials_per_task):
+                    logging.info("Starting %s task %d episode %d", suite_name, task_index, episode_index)
                     env.reset()
                     obs = env.set_init_state(initial_states[episode_index])
                     action_plan: collections.deque[np.ndarray] = collections.deque()
@@ -309,6 +313,10 @@ def eval_libero(args: Args) -> None:
                     total_episodes += 1
                     suite_episodes += 1
                     total_successes += int(done)
+                    logging.info(
+                        "Finished %s task %d episode %d: success=%s steps=%d error=%s",
+                        suite_name, task_index, episode_index, done, timestep, rollout_error,
+                    )
                     suite_successes += int(done)
                     if done:
                         task_successes += 1
